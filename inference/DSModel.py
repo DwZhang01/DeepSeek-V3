@@ -486,3 +486,125 @@ class Expert(nn.Module):
             torch.Tensor: Output tensor after expert computation.
         """
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class MoE(nn.Module):
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.dim = args.dim
+        assert (
+            args.n_routed_experts % world_size == 0
+        ), f"n_routed_experts {args.n_routed_experts} must be divisible by world_size {world_size}"
+        self.n_routed_experts = args.n_routed_experts
+        self.n_local_experts = args.n_routed_experts // world_size
+        self.n_activated_experts = args.n_activated_experts
+        self.experts_start_idx = rank * self.n_local_experts
+        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+        self.gate = Gate(args)
+        self.experts = nn.ModuleList(
+            [
+                (
+                    Expert(args.dim, args.moe_inter_dim)
+                    if self.experts_start_idx <= i < self.experts_end_idx
+                    else None
+                )
+                for i in range(self.n_routed_experts)
+            ]
+        )
+        self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shape = x.size()
+        x = x.view(-1, self.dim)
+        weights, indices = self.gate(x)
+        y = torch.zeros_like(x)
+        counts = torch.bincount(
+            indices.flatten(), minlength=self.n_routed_experts
+        ).tolist()
+        for i in range(self.experts_start_idx, self.experts_end_idx):
+            if counts[i] == 0:
+                continue
+            expert = self.experts[i]
+            idx, top = torch.where(indices == i)
+            y[idx] += expert(x[idx]) * weights[idx, top, None]
+        z = self.shared_experts(x)
+        if world_size > 1:
+            dist.all_reduce(y)
+        return (y + z).view(shape)
+
+
+class Block(nn.Module):
+
+    def __init__(self, layer_id: int, args: ModelArgs):
+        # initialize the Transformer block
+        super().__init__()
+        self.attn = MLA(args)
+        self.ffn = (
+            MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoE
+        )
+        self.attn_norm = RMSNorm(args.dim)
+        self.ffn_norm = RMSNorm(args.dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+
+        x = x + self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
+        x = x + self.ffn(self.ffn_norm(x))
+        return x
+
+
+class Transformer(nn.Module):
+
+    def __init__(self, args: ModelArgs):
+        global world_size, rank
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        Linear.dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
+        super().__init__()
+        self.max_seq_len = args.max_seq_len
+        self.embed = ParallelEmbedding(args.vocab_size, args.dim)
+        self.layers = torch.nn.ModuleList()
+        for layer_id in range(args.n_layers):
+            self.layers.append(Block(layer_id, args))
+        self.norm = RMSNorm(args.dim)
+        self.head = ColumnParallelLinear(
+            args.dim, args.vocab_size, dtype=torch.get_default_dtype()
+        )
+        self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
+
+    @torch.inference_mode()
+    def forward(self, tokens: torch.Tensor, start_pos: int = 0):
+
+        seqlen = tokens.size(1)
+        h = self.embed(tokens)
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        mask = None
+        if seqlen > 1:
+            mask = torch.full(
+                (seqlen, seqlen), float("-inf"), device=tokens.device
+            ).triu_(1)
+        for layer in self.layers:
+            h = layer(h, start_pos, freqs_cis, mask)
+        h = self.norm(h)[:, -1]
+        logits = self.head(h)
+        if world_size > 1:
+            all_logits = [torch.empty_like(logits) for _ in range(world_size)]
+            dist.all_gather(all_logits, logits)
+            logits = torch.cat(all_logits, dim=-1)
+        return logits
+
+
+if __name__ == "__main__":
+    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_device("cuda")
+    torch.manual_seed(0)
+    args = ModelArgs()
+    x = torch.randint(0, args.vocab_size, (2, 128))
+    model = Transformer(args)
+    print(model(x).size())
